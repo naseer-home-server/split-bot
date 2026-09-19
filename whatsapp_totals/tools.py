@@ -48,11 +48,18 @@ def _format_snapshot(data: dict[str, Any]) -> str:
     lines = [
         f"totals_id: {data.get('totals_id')}",
         f"poll_id: {data.get('poll_id')}",
-        f"item_total: {_money(data.get('item_total'))}",
-        f"calculated_total: {_money(data.get('calculated_total'))}",
-        f"total_in_bill: {_money(data.get('total_in_bill'))}",
-        f"discount: {_money(data.get('discount'))}",
     ]
+    title = data.get("title")
+    if title:
+        lines.append(f"title: {title}")
+    lines.extend(
+        [
+            f"item_total: {_money(data.get('item_total'))}",
+            f"calculated_total: {_money(data.get('calculated_total'))}",
+            f"total_in_bill: {_money(data.get('total_in_bill'))}",
+            f"discount: {_money(data.get('discount'))}",
+        ]
+    )
 
     tax = data.get("tax") or []
     if tax:
@@ -130,7 +137,7 @@ def create_bill_totals(
     tax_json: str,
     total_in_bill: float,
     discount: float = 0.0,
-    title: str = "Who had what?",
+    title: str = "",
 ) -> str:
     """
     Create a stateful bill totals record and a WhatsApp poll of items.
@@ -148,7 +155,8 @@ def create_bill_totals(
             Example: '[{"name":"GST","multiplier":1.1}]'
         total_in_bill: The amount the bill says is due.
         discount: Discount amount after tax; 0 if none.
-        title: Short poll title.
+        title: Optional short name for this bill (restaurant or occasion). Also used as the poll
+            title and Google Sheet tab name. Empty uses a default poll title.
 
     Returns:
         totals_id and poll_id on success, or a mismatch error with calculated vs billed totals.
@@ -188,10 +196,12 @@ def create_bill_totals(
 
         data = response.json()
         if data.get("status") == "success" and data.get("totals_id") is not None:
+            title = data.get("title")
+            title_bit = f" title: {title}." if title else ""
             return (
                 "Bill totals created successfully. "
                 f"totals_id: {data['totals_id']}. "
-                f"poll_id: {data.get('poll_id')}. "
+                f"poll_id: {data.get('poll_id')}.{title_bit} "
                 f"item_total: {_money(data.get('item_total'))}. "
                 f"calculated_total: {_money(data.get('calculated_total'))}. "
                 f"total_in_bill: {_money(data.get('total_in_bill'))}. "
@@ -211,6 +221,7 @@ def get_bill_assignments(totals_id: str) -> str:
 
     Use this when users are done voting, ask to split, or assign items in chat.
     Use the owed amounts returned here for the split.
+    If this totals_id has been exported to Google Sheets, assignments are read from the sheet checkboxes.
 
     Args:
         totals_id: The totals_id returned by create_bill_totals.
@@ -291,13 +302,15 @@ def export_bill_to_google_sheet(totals_id: str, extra_people_json: str = "[]") -
     Completely optional: call this only when a user explicitly asks for a spreadsheet or Google Sheet.
     Do not call it as part of the normal split workflow.
 
-    People already in the split get a column. Use extra_people_json to add more name columns.
-    Re-exporting the same totals_id updates the existing sheet.
+    Writes a tab into the shared workbook. People already in the split get a column.
+    Use extra_people_json to add more columns: WhatsApp mentions/LIDs or typed names.
+    Re-exporting the same totals_id updates that tab.
 
     Args:
         totals_id: The totals_id returned by create_bill_totals.
-        extra_people_json: JSON array of extra display names to add as columns, e.g. '["Sam","Lee"]'.
-            Use '[]' if no extra people.
+		extra_people_json: JSON array of extra people to add as columns, e.g. '["@60123456789","Sam"]'.
+            Use a WhatsApp mention/LID when the user tagged someone (@digits, or a user id from assignments).
+            Use a plain display name when they typed a name. Use '[]' if no extra people.
 
     Returns:
         The Google Sheet URL, or an error message.
@@ -308,7 +321,7 @@ def export_bill_to_google_sheet(totals_id: str, extra_people_json: str = "[]") -
         except json.JSONDecodeError as e:
             return f"Error: extra_people_json must be valid JSON — {e}"
         if not isinstance(extra, list):
-            return "Error: extra_people_json must be a JSON array of names"
+            return "Error: extra_people_json must be a JSON array of names or LIDs"
         names = [str(n).strip() for n in extra if str(n).strip()]
 
         payload = {"totals_id": int(totals_id), "extra_people": names}
