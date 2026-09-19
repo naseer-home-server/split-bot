@@ -14,6 +14,7 @@ from whatsapp_totals.tools import (
     create_bill_totals,
     get_bill_assignments,
     set_bill_assignments,
+    export_bill_to_google_sheet,
 )
 from ocr import ocr_image_url, ocr_image_base64, set_logger
 from metrics import (
@@ -62,6 +63,8 @@ SYSTEM_PROMPT = """You are Split. You help users split dinner bills in a group c
 ..."
 
 8. Splitwise: Ask who paid for the bill. Put the step 7 breakdown in add_expense's details field; use participants' @usernames correctly. Respond with expense id and title. You can update/delete an expense if needed.
+
+Google Sheet export is optional and not part of the default workflow. Call export_bill_to_google_sheet only if a user explicitly asks for a spreadsheet / Google Sheet. Do not offer it unprompted. If they ask, pass extra_people_json only for names they want added, then share the returned URL.
 
 If conversation skips steps, state what you need next. Users may rarely ask only to record a Splitwise expense with everything already settled — then you may call add_expense directly.
 
@@ -215,6 +218,7 @@ async def process_message(request: SplitBotRequest) -> str:
             create_bill_totals,
             get_bill_assignments,
             set_bill_assignments,
+            export_bill_to_google_sheet,
         ]
 
         # Use context manager to properly manage database connection

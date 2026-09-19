@@ -282,3 +282,52 @@ def set_bill_assignments(totals_id: str, assignments_json: str) -> str:
         return f"Error: HTTP request failed — {e}"
     except Exception as e:
         return f"Error: {e}"
+
+
+@tool
+def export_bill_to_google_sheet(totals_id: str, extra_people_json: str = "[]") -> str:
+    """
+    Export the current bill totals to a Google Sheet with live formulas and checkboxes.
+    Completely optional: call this only when a user explicitly asks for a spreadsheet or Google Sheet.
+    Do not call it as part of the normal split workflow.
+
+    People already in the split get a column. Use extra_people_json to add more name columns.
+    Re-exporting the same totals_id updates the existing sheet.
+
+    Args:
+        totals_id: The totals_id returned by create_bill_totals.
+        extra_people_json: JSON array of extra display names to add as columns, e.g. '["Sam","Lee"]'.
+            Use '[]' if no extra people.
+
+    Returns:
+        The Google Sheet URL, or an error message.
+    """
+    try:
+        try:
+            extra = json.loads(extra_people_json) if extra_people_json.strip() else []
+        except json.JSONDecodeError as e:
+            return f"Error: extra_people_json must be valid JSON — {e}"
+        if not isinstance(extra, list):
+            return "Error: extra_people_json must be a JSON array of names"
+        names = [str(n).strip() for n in extra if str(n).strip()]
+
+        payload = {"totals_id": int(totals_id), "extra_people": names}
+        url = f"{_whatsapp_base_url()}/totals/export-sheet"
+        with httpx.Client() as client:
+            response = client.post(url, json=payload, timeout=60.0)
+
+        if response.status_code != 200:
+            return _api_error_message(response)
+
+        data = response.json()
+        if data.get("status") != "success":
+            return f"Error: unexpected response — {data!r}"
+        sheet_url = data.get("url")
+        sheet_id = data.get("sheet_id")
+        if not sheet_url:
+            return f"Error: unexpected response — {data!r}"
+        return f"Google Sheet ready. sheet_id: {sheet_id}. URL: {sheet_url}"
+    except httpx.HTTPError as e:
+        return f"Error: HTTP request failed — {e}"
+    except Exception as e:
+        return f"Error: {e}"
