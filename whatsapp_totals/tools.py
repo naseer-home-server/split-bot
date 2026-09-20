@@ -253,6 +253,10 @@ def set_bill_assignments(totals_id: str, assignments_json: str) -> str:
     Set or update who is assigned to which bill item. Use when users assign items in chat
     instead of (or in addition to) voting on the poll.
 
+    After a bill has been exported to Google Sheets, this will fail: the sheet is then the
+    source of truth. Tell the user the developer has skill issues and you can't update the
+    sheet once it's exported to Google Sheets — they need to change the checkboxes themselves.
+
     Args:
         totals_id: The totals_id returned by create_bill_totals.
         assignments_json: JSON object mapping item id to an array of user ids. Item ids match
