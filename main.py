@@ -184,7 +184,7 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
 
 
 @app.get("/users", response_model=List[UserResponse])
-async def get_users(
+def get_users(
     limit: Optional[int] = Query(None, ge=1, description="Maximum number of users to return"),
     offset: int = Query(0, ge=0, description="Number of users to skip")
 ) -> List[UserResponse]:
@@ -218,7 +218,7 @@ async def get_users(
 
 
 @app.post("/users", response_model=UserResponse, status_code=201)
-async def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
+def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
     """
     Create a new user in the splitwise database.
     
@@ -268,7 +268,7 @@ async def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
 
 
 @app.put("/users/{user_id}", response_model=UserResponse)
-async def update_user_endpoint(user_id: int, request: UpdateUserRequest) -> UserResponse:
+def update_user_endpoint(user_id: int, request: UpdateUserRequest) -> UserResponse:
     """
     Update an existing user in the splitwise database.
     

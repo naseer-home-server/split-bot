@@ -308,7 +308,7 @@ def export_bill_to_google_sheet(totals_id: str, extra_people_json: str = "[]") -
 
     Args:
         totals_id: The totals_id returned by create_bill_totals.
-		extra_people_json: JSON array of extra people to add as columns, e.g. '["@60123456789","Sam"]'.
+        extra_people_json: JSON array of extra people to add as columns, e.g. '["@60123456789","Sam"]'.
             Use a WhatsApp mention/LID when the user tagged someone (@digits, or a user id from assignments).
             Use a plain display name when they typed a name. Use '[]' if no extra people.
 
@@ -322,9 +322,22 @@ def export_bill_to_google_sheet(totals_id: str, extra_people_json: str = "[]") -
             return f"Error: extra_people_json must be valid JSON — {e}"
         if not isinstance(extra, list):
             return "Error: extra_people_json must be a JSON array of names or LIDs"
-        names = [str(n).strip() for n in extra if str(n).strip()]
+        extras = []
+        for item in extra:
+            if isinstance(item, str):
+                s = item.strip()
+            elif isinstance(item, (int, float)):
+                s = str(item).strip()
+            else:
+                return "Error: extra_people_json must be a JSON array of names or LIDs"
+            if s:
+                extras.append(s)
 
-        payload = {"totals_id": int(totals_id), "extra_people": names}
+
+        payload = {
+            "totals_id": int(totals_id),
+            "extra_people": extras,
+        }
         url = f"{_whatsapp_base_url()}/totals/export-sheet"
         with httpx.Client() as client:
             response = client.post(url, json=payload, timeout=60.0)

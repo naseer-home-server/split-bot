@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import asyncio
 from typing import Any, Optional
 from langchain.agents import create_agent, AgentState
 from langchain.agents.middleware import before_model
@@ -202,66 +203,27 @@ async def process_message(request: SplitBotRequest) -> str:
         raise error
 
     try:
-        # Initialize ChatOpenAI with OpenRouter configuration
-        model = ChatOpenAI(
-            model="openai/gpt-5.6-luna",
-            base_url=base_url,
-            api_key=api_token,
-            temperature=0.7,
+        # agent.invoke and its sync httpx tools block. Run them off the event loop so
+        # nested split-bot HTTP (e.g. export → GET /users) can be served concurrently.
+        ai_response = await asyncio.to_thread(
+            _invoke_agent,
+            user_message,
+            request.bot_name,
+            request.group_id,
+            base_url,
+            api_token,
+            db_connection_string,
         )
 
-        # Create agent with checkpointer and trim_messages middleware
-        tools = [
-            add_expense,
-            update_expense,
-            delete_expense,
-            create_bill_totals,
-            get_bill_assignments,
-            set_bill_assignments,
-            export_bill_to_google_sheet,
-        ]
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(
+            platform_type=platform_type, status="success"
+        ).inc()
 
-        # Use context manager to properly manage database connection
-        with PostgresSaver.from_conn_string(db_connection_string) as checkpointer:
-            checkpointer.setup()
-
-            # Create agent within the context manager
-            # Use bot_name from request to generate system prompt
-            system_prompt_with_bot_name = get_system_prompt(
-                request.bot_name, request.group_id
-            )
-            agent = create_agent(
-                model,
-                tools,
-                system_prompt=system_prompt_with_bot_name,
-                checkpointer=checkpointer,
-                middleware=[trim_messages],
-            )
-
-            # Invoke agent with message and thread_id (group_id)
-            # The checkpointer automatically handles message history persistence
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": user_message}]},
-                {
-                    "configurable": {
-                        "thread_id": request.group_id,
-                    }
-                },
-            )
-
-            # Extract the AI response from the last message
-            ai_response = result["messages"][-1].content
-
-            # Track successful processing
-            duration = time.time() - start_time
-            ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
-                duration
-            )
-            ai_processing_total.labels(
-                platform_type=platform_type, status="success"
-            ).inc()
-
-            return ai_response
+        return ai_response
 
     except Exception as e:
         duration = time.time() - start_time
@@ -274,6 +236,45 @@ async def process_message(request: SplitBotRequest) -> str:
         ).inc()
         logger.error(f"Error processing message with AI: {str(e)}")
         raise
+
+
+def _invoke_agent(
+    user_message: str,
+    bot_name: str,
+    group_id: str,
+    base_url: str,
+    api_token: str,
+    db_connection_string: str,
+) -> str:
+    model = ChatOpenAI(
+        model="openai/gpt-5.6-luna",
+        base_url=base_url,
+        api_key=api_token,
+        temperature=0.7,
+    )
+    tools = [
+        add_expense,
+        update_expense,
+        delete_expense,
+        create_bill_totals,
+        get_bill_assignments,
+        set_bill_assignments,
+        export_bill_to_google_sheet,
+    ]
+    with PostgresSaver.from_conn_string(db_connection_string) as checkpointer:
+        checkpointer.setup()
+        agent = create_agent(
+            model,
+            tools,
+            system_prompt=get_system_prompt(bot_name, group_id),
+            checkpointer=checkpointer,
+            middleware=[trim_messages],
+        )
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": user_message}]},
+            {"configurable": {"thread_id": group_id}},
+        )
+        return result["messages"][-1].content
 
 
 @before_model
