@@ -1,153 +1,300 @@
 import os
 import logging
+import time
+import asyncio
 from typing import Any, Optional
 from langchain.agents import create_agent, AgentState
 from langchain.agents.middleware import before_model
-from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.runtime import Runtime
 from splitwise.tools import add_expense, update_expense, delete_expense
-from ocr import process_image_with_mistral_ocr, set_logger
+from whatsapp_totals.tools import (
+    create_bill_totals,
+    get_bill_assignments,
+    set_bill_assignments,
+    export_bill_to_google_sheet,
+)
+from ocr import ocr_image_url, ocr_image_base64, set_logger
+from bill_classifier import classify_ocr_as_bill
+from metrics import (
+    ai_processing_duration_seconds,
+    ai_processing_total,
+    ai_processing_errors_total,
+)
 
 logger = logging.getLogger(__name__)
 
 # Set logger for OCR module
 set_logger(logger)
 
+
+class SilentSkip(Exception):
+    """Signal that the bot must send no response (e.g. non-bill image)."""
+
+    pass
+
 # System prompt for the AI
-SYSTEM_PROMPT = '''You are Split. A helpful bot who's purpose is to help users split their dinner bills. You are part of a group chat where users will interact with you. Follow the steps below to help them split the bill
+SYSTEM_PROMPT = """You are Split. You help users split dinner bills in a group chat. The WhatsApp group_id for this chat is <GROUP_ID> (pass this exact value as group_id to create_bill_totals). Follow the workflow below.
 
-1. The user should send an image of a bill. This image will be parsed by an OCR tool into markdown which will be sent to you. The user does not know the details about this OCR tool so you need to respond as though you can "see and read the bill". If the markdown passed to you does not look like a bill, then its most likely not an image of a bill or an very unclear one. Apologise and ask the user to send another picture of the bill if this happens. If the parsed bill is in any language other than english, translate it to english. Ask the user what language it is in if it is unclear.
-2. Confirm with the user that the markdown you received from the OCR tool is accurate. Return a message to the user in a list format where each item is like this "- {Item} (Qty {Quantity}) -> ${price}". Make sure you the user confirms the list is correct. There are cases where users may ask you to correct the list because the OCR result was inaccurate, make the appropriate changes and send them the new list. Keep doing this until user confirms. When you respond to the user make sure you remind them to @naseer_split_bot when they intend to talk to you
-3. The user may directly tell who ate what or may just give you a list of people who were present for the dinner. You will need to find who ate what and do the splits. Every time someone tells you about an item they ate, return a list of unaccounted for items, the format should be like this
-"Assigned so far
-- Item Name (price) - split by {number} of people/person
-    - Person 1 name (owes {price/n})
-    - Person 2 name (owes {price/n})
+1. Bill image: The user sends a bill image; an OCR tool turns it into markdown you receive. Respond as though you read the bill yourself. If it does not look like a bill, apologise and ask for a clearer photo. If the bill is not in English, translate it; ask which language it is if unclear. When guiding the group, remind users to @<BOT_NAME> when addressing you.
 
-Not yet assigned
-- Item Name (price)
-"
-Make sure you handle items with > 1 quantity correctly. Again whenever you respond to the user make sure to remind the to @naseer_split_bot when they intend to talk to you
-4. Now that you have all information you need to do the splits. Use the calculator to do all the maths, don't ever try to do math on your own!. Make sure you do the tax splits correctly based on what everyone ate. After you make the splits finally use the calculator tool to check that the sum of everyone's amount adds up to the total in the bill
-5. Send a final list of people along with how much they owe in the format given below
-"
-{Restaurant Name from bill if you can find it} Bill Split
+2. Create bill totals: After you have usable line items from the bill, call create_bill_totals with group_id="<GROUP_ID>", items_json, tax_json, discount, total_in_bill, and an optional short title (restaurant or occasion).
+   - items_json: JSON array of objects {name, quantity, unit_price}. One poll option per line; quantity is shown on the option. Everyone who votes for an option shares that full line (quantity × unit price).
+   - tax_json: JSON array of {name, multiplier}. 10% is 1.1, 9% is 1.09. Use [] if there is no tax. Multiple taxes are stacked (multiplied in order).
+   - discount: a single number after tax, 0 if none.
+   - total_in_bill: the amount the bill says is due.
+   - If the tool returns a totals mismatch, do not retry on your own. Show the user what you read and what the tool calculated, and ask them to confirm or correct it. Include:
+     - each item with quantity and unit price
+     - tax (name and multiplier) and discount
+     - total_in_bill (from the bill)
+     - calculated_total (from the tool)
+     Ask them to correct any wrong number, or send a clearer photo of the bill. Only call create_bill_totals again after they reply with a correction or a new image.
+   - Remember totals_id from the success response.
 
-- username1 owes {amount they owe}
-    - Item (price they owe)
-- username1 owes {amount they owe}
-"
-6. Finally the user may choose to add the expense to Splitwise. You will need to know who paid for the bill. Make sure you put the information from step 5 into the details field of the add_expense tool. The sender_ids used in the add_expense tool are actually the @username of the user. So make sure you know the @username of the everyone involved in the bill. You also have the ability to update/delete the expense if you need to. Make sure you respond with the expense ID and expense title to the user.
+3. Updating the bill: If users correct line items, tax, discount, or the billed total, call create_bill_totals again with the new values. Treat the most recently created totals_id as authoritative.
 
-If users don't naturally follow the steps described here, tell them what you require to move forward. Do note the user's may directly ask you to add an expense (for which they have all the details) to splitwise. In that case, you can use the add_expense tool directly.
+4. When to load assignments:
+   - If users say they are done voting, or ask you to split / calculate, call get_bill_assignments using the latest totals_id first.
+   - If users try to assign items manually before or instead of relying on votes, still call get_bill_assignments first. Call it for every modification message. If chat instructions conflict with current assignments, flag it and confirm.
 
-Make sure your answers are succinct, don't be too verbose
-'''
+5. Completing assignments: get_bill_assignments lists unassigned items and current shares. Ask who ate unassigned items; users may reply by option number or food name. Multiple people on one option share the full quantity. To apply chat assignments, call set_bill_assignments with item ids from get_bill_assignments (they match poll option numbers), then get_bill_assignments again. Repeat until every item has an owner (or explicit split among people).
 
-MAX_HISTORY_MESSAGES = 20
+6. Splitting totals: Use the owed amounts and item breakdown from get_bill_assignments shares.
+
+7. Final message: Send the breakdown in this shape:
+"{Restaurant name if known} Bill Split
+- @username owes {amount}
+    - Item (their share)
+..."
+
+8. Splitwise: Always call get_bill_assignments with the latest totals_id immediately before add_expense, even if you already loaded shares earlier. Use those owed amounts (do not reuse stale numbers). Ask who paid for the bill. Put the step 7 breakdown in add_expense's details field; use participants' @usernames correctly. Respond with expense id and title. You can update/delete an expense if needed.
+
+Google Sheet export is optional and not part of the default workflow. Call export_bill_to_google_sheet only if a user explicitly asks for a spreadsheet / Google Sheet. Do not offer it unprompted. If they ask, pass extra_people_json for people they want added who are not already in the split: use the WhatsApp mention/LID when they tagged someone (@123456789 or a user id from assignments), and a plain name when they typed a name. Then share the returned URL. After a bill has been exported, get_bill_assignments reads checkbox assignments from that sheet. Do not call set_bill_assignments after export. If that request is blocked, tell the user the developer has skill issues and you can't update the sheet once it's exported to Google Sheets — they need to change the checkboxes on the sheet themselves. If someone keeps voting on the poll, they will be told to update the sheet instead.
+
+If conversation skips steps, state what you need next. Users may rarely ask only to record a Splitwise expense with everything already settled — then you may call add_expense directly, but if a totals_id exists you must still call get_bill_assignments first and use those shares.
+
+Stay succinct.
+"""
+
+MAX_HISTORY_MESSAGES = 100
+
 
 class SplitBotRequest:
-    def __init__(self, message: str, group_id: str, sender: str, image_url: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        group_id: str,
+        sender: str,
+        platform_type: str,
+        image_url: Optional[str] = None,
+        image_base64: Optional[Any] = None,
+        bot_name: str = "me",
+    ):
         self.message = message
         self.group_id = group_id
         self.sender = sender
+        self.platform_type = platform_type
         self.image_url = image_url
-    
+        self.image_base64 = image_base64
+        self.bot_name = bot_name
+
     async def to_user_message(self) -> str:
-        message = f"(Sender ID:{self.sender}): {self.message}"
-        
-        # Process OCR if image_url is provided
-        if self.image_url:
-            logger.info(f"Processing OCR for image URL: {self.image_url}")
-            ocr_text = await process_image_with_mistral_ocr(self.image_url)
-            if not ocr_text or ocr_text.startswith("Error:"):
-                # Raise exception if OCR failed - will be caught in process_message
-                raise ValueError(ocr_text if ocr_text else "Sorry, I couldn't extract any text from the image.")
+        message = f"(Username:{self.sender}): {self.message}"
+
+        # Process OCR if image_base64 is provided (priority over image_url)
+        if self.image_base64:
+            logger.info("Processing OCR for base64 image")
+            ocr_text = await ocr_image_base64(
+                self.image_base64.data, self.image_base64.mtype
+            )
+            await self._require_bill_ocr(ocr_text)
             message += f"\n\nOCR Image Text: {ocr_text}"
-        
+        # Process OCR if image_url is provided
+        elif self.image_url:
+            logger.info("Processing OCR for image URL: %s", self.image_url)
+            ocr_text = await ocr_image_url(self.image_url)
+            await self._require_bill_ocr(ocr_text)
+            message += f"\n\nOCR Image Text: {ocr_text}"
+
         return message
 
-async def process_message(request: SplitBotRequest) -> str:
+    async def _require_bill_ocr(self, ocr_text: Optional[str]) -> None:
+        """
+        After OCR, gate image handling through Jev. Non-bills and OCR failures
+        raise SilentSkip so ingress stays completely silent.
+        """
+        if not ocr_text or ocr_text.startswith("Error:"):
+            # Fail closed: empty/garbled OCR is not a bill — stay silent.
+            raise SilentSkip()
+        if not await classify_ocr_as_bill(ocr_text):
+            raise SilentSkip()
+
+
+def get_system_prompt(bot_name: str, group_id: str) -> str:
+    return SYSTEM_PROMPT.replace("<BOT_NAME>", bot_name).replace("<GROUP_ID>", group_id)
+
+
+async def process_message(request: SplitBotRequest) -> Optional[str]:
     """
     Process a message using Grok 4 Fast via OpenRouter with conversation memory stored in PostgreSQL.
-    Uses LangChain agents with a calculator tool and checkpoint-based memory.
-    
+    Uses LangChain agents with checkpoint-based memory.
+
     Args:
-        request: SplitBotRequest object containing message, group_id, sender, and optionally image_url
-        
+        request: SplitBotRequest object containing message, group_id, sender, platform_type, and optionally image_url
+
     Returns:
-        The AI's response as a string
+        The AI's response as a string, or None when the bot must stay silent
+        (non-bill / empty OCR after image classification).
     """
-    # Get user message (OCR processing happens inside to_user_message)
+    platform_type = request.platform_type.strip().upper()
+    start_time = time.time()
+
+    # Get user message (OCR + bill classification happen inside to_user_message)
     try:
         user_message = await request.to_user_message()
+    except SilentSkip:
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(
+            platform_type=platform_type, status="skipped_non_bill"
+        ).inc()
+        logger.info(
+            "Skipping response for group=%s (non-bill or unusable OCR)",
+            request.group_id,
+        )
+        return None
     except ValueError as e:
-        # Return error message if OCR failed
+        # Return error message if OCR failed in an unexpected way
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(platform_type=platform_type, status="failure").inc()
+        ai_processing_errors_total.labels(
+            platform_type=platform_type, error_type="OCRError"
+        ).inc()
         return str(e)
-    
+
     # Get environment variables
     base_url = os.getenv("AI_BASE_URL")
     api_token = os.getenv("AI_TOKEN")
     db_connection_string = os.getenv("DB_CONNECTION_STRING")
-    
+
     if not base_url:
-        raise ValueError("AI_BASE_URL environment variable is required")
-    
+        error = ValueError("AI_BASE_URL environment variable is required")
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(platform_type=platform_type, status="failure").inc()
+        ai_processing_errors_total.labels(
+            platform_type=platform_type, error_type="ConfigurationError"
+        ).inc()
+        raise error
+
     if not api_token:
-        raise ValueError("AI_TOKEN environment variable is required")
-    
+        error = ValueError("AI_TOKEN environment variable is required")
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(platform_type=platform_type, status="failure").inc()
+        ai_processing_errors_total.labels(
+            platform_type=platform_type, error_type="ConfigurationError"
+        ).inc()
+        raise error
+
     if not db_connection_string:
         logger.error("DB_CONNECTION_STRING not found in environment variables")
-        raise ValueError("DB_CONNECTION_STRING environment variable is required")
-    
-    try:
-        # Initialize ChatOpenAI with OpenRouter configuration
-        model = ChatOpenAI(
-            model="x-ai/grok-4-fast",
-            base_url=base_url,
-            api_key=api_token,
-            temperature=0.7,
+        error = ValueError("DB_CONNECTION_STRING environment variable is required")
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
         )
-        
-        # Create agent with calculator tool, checkpointer, and trim_messages middleware
-        tools = [calculator, add_expense, update_expense, delete_expense]
-        
-        # Use context manager to properly manage database connection
-        with PostgresSaver.from_conn_string(db_connection_string) as checkpointer:
-            checkpointer.setup()
-            
-            # Create agent within the context manager
-            agent = create_agent(
-                model, 
-                tools, 
-                system_prompt=SYSTEM_PROMPT,
-                checkpointer=checkpointer,
-                middleware=[trim_messages]
-            )
-            
-            # Invoke agent with message and thread_id (group_id)
-            # The checkpointer automatically handles message history persistence
-            result = agent.invoke(
-                {"messages": [{"role": "user", "content": user_message}]},
-                {
-                    "configurable": {
-                        "thread_id": request.group_id,
-                    }
-                }
-            )
-            
-            # Extract the AI response from the last message
-            ai_response = result["messages"][-1].content
-            
-            return ai_response
-        
+        ai_processing_total.labels(platform_type=platform_type, status="failure").inc()
+        ai_processing_errors_total.labels(
+            platform_type=platform_type, error_type="ConfigurationError"
+        ).inc()
+        raise error
+
+    try:
+        # agent.invoke and its sync httpx tools block. Run them off the event loop so
+        # nested split-bot HTTP (e.g. export → GET /users) can be served concurrently.
+        ai_response = await asyncio.to_thread(
+            _invoke_agent,
+            user_message,
+            request.bot_name,
+            request.group_id,
+            base_url,
+            api_token,
+            db_connection_string,
+        )
+
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(
+            platform_type=platform_type, status="success"
+        ).inc()
+
+        return ai_response
+
     except Exception as e:
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(platform_type=platform_type, status="failure").inc()
+        ai_processing_errors_total.labels(
+            platform_type=platform_type, error_type=type(e).__name__
+        ).inc()
         logger.error(f"Error processing message with AI: {str(e)}")
         raise
+
+
+def _invoke_agent(
+    user_message: str,
+    bot_name: str,
+    group_id: str,
+    base_url: str,
+    api_token: str,
+    db_connection_string: str,
+) -> str:
+    model = ChatOpenAI(
+        model="openai/gpt-5.6-luna",
+        base_url=base_url,
+        api_key=api_token,
+        temperature=0.7,
+    )
+    tools = [
+        add_expense,
+        update_expense,
+        delete_expense,
+        create_bill_totals,
+        get_bill_assignments,
+        set_bill_assignments,
+        export_bill_to_google_sheet,
+    ]
+    with PostgresSaver.from_conn_string(db_connection_string) as checkpointer:
+        checkpointer.setup()
+        agent = create_agent(
+            model,
+            tools,
+            system_prompt=get_system_prompt(bot_name, group_id),
+            checkpointer=checkpointer,
+            middleware=[trim_messages],
+        )
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": user_message}]},
+            {"configurable": {"thread_id": group_id}},
+        )
+        return result["messages"][-1].content
 
 
 @before_model
@@ -158,39 +305,9 @@ def trim_messages(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
     """
     messages = state["messages"]
 
-    
     if len(messages) <= MAX_HISTORY_MESSAGES:
         return None  # No changes needed
-    
+
     recent_messages = messages[-MAX_HISTORY_MESSAGES:]
-    
-    return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            *recent_messages
-        ]
-    }
 
-
-@tool
-def calculator(expression: str) -> str:
-    """
-    Evaluate a mathematical expression and return the result.
-    
-    Args:
-        expression: A mathematical expression as a string (e.g., "2 + 2", "10 * 5", "100 / 4")
-        
-    Returns:
-        The result of the calculation as a string
-    """
-    try:
-        # Safely evaluate the mathematical expression
-        # Only allow basic math operations and numbers
-        allowed_chars = set('0123456789+-*/.() ')
-        if not all(c in allowed_chars for c in expression):
-            return "Error: Invalid characters in expression. Only numbers and basic operators (+, -, *, /) are allowed."
-        
-        result = eval(expression)
-        return str(result)
-    except Exception as e:
-        return f"Error calculating: {str(e)}"
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *recent_messages]}

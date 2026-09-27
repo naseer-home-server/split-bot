@@ -1,16 +1,18 @@
 import logging
 import os
+import time
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 from contextlib import asynccontextmanager
+from prometheus_fastapi_instrumentator import Instrumentator
 from ai import process_message, SplitBotRequest
 from db import connect_db, close_db
 from dotenv import load_dotenv
-from chat_whitelist import init_chat_whitelist_table, search_whitelisted_chat
-from splitwise.users import init_users_table, get_all_users, create_user
+from splitwise.users import init_users_table, get_all_users, create_user, update_user, get_user_by_id
 from psycopg.errors import UniqueViolation
+from metrics import messages_processed_total, users_created_total, db_query_duration_seconds, db_errors_total
 
 # Load environment variables
 load_dotenv()
@@ -36,7 +38,6 @@ async def lifespan(app: FastAPI):
         connect_db()
         logger.info("Database connection established on startup")
         init_users_table()
-        init_chat_whitelist_table()
     except Exception as e:
         logger.error(f"Failed to connect to database on startup: {str(e)}")
         raise
@@ -57,6 +58,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Set up Prometheus instrumentation
+instrumentator = Instrumentator()
+instrumentator.instrument(app).expose(app)
+
+
+class ImageBase64(BaseModel):
+    """Model for base64-encoded image data"""
+    data: str = Field(..., description="Base64-encoded image data")
+    mtype: str = Field(..., description="MIME type of the image (e.g., 'image/png', 'image/jpeg')")
+
 
 class ProcessMessageRequest(BaseModel):
     """Pydantic model for request validation matching SplitBotRequest"""
@@ -65,6 +76,8 @@ class ProcessMessageRequest(BaseModel):
     sender: str = Field(..., description="The sender ID")
     platform_type: str = Field(..., description="Platform type (WHATSAPP or TELEGRAM)")
     image_url: Optional[str] = Field(None, description="Optional URL to an image for OCR processing")
+    image_base64: Optional[ImageBase64] = Field(None, description="Optional base64-encoded image for OCR processing")
+    bot_name: Optional[str] = Field("me", description="The bot name to use in the system prompt")
 
 
 class ProcessMessageResponse(BaseModel):
@@ -97,27 +110,13 @@ class CreateUserRequest(BaseModel):
     whatsapp_lid: Optional[str] = Field(None, description="User's WhatsApp LID")
 
 
-def check_group_whitelisted(group_id: str, platform_type: str) -> bool:
-    """
-    Check if a group_id is whitelisted for the given platform_type.
-    
-    Args:
-        group_id: The group ID to check
-        platform_type: The platform type (WHATSAPP or TELEGRAM)
-    
-    Returns:
-        bool: True if the group is whitelisted, False otherwise
-    """
-    try:
-        platform_type = platform_type.strip().upper()
-        results = search_whitelisted_chat(
-            group_id=group_id.strip(),
-            platform_type=platform_type
-        )
-        return len(results) > 0
-    except Exception as e:
-        logger.error(f"Error checking whitelist: {str(e)}")
-        return False
+class UpdateUserRequest(BaseModel):
+    """Request model for updating a user"""
+    name: Optional[str] = Field(None, description="User's name")
+    email: Optional[str] = Field(None, description="User's email")
+    telegram_username: Optional[str] = Field(None, description="User's Telegram username")
+    whatsapp_number: Optional[str] = Field(None, description="User's WhatsApp number")
+    whatsapp_lid: Optional[str] = Field(None, description="User's WhatsApp LID")
 
 
 @app.post("/process_message", response_model=ProcessMessageResponse)
@@ -128,27 +127,30 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
     Accepts a JSON body with message, group_id, sender, platform_type, and optional image_url.
     Returns the AI's response or an error message.
     """
+    platform_type = request.platform_type.strip().upper()
+    group_id = request.group_id.strip()
+    
     try:
-        # Check if group is whitelisted
-        if not check_group_whitelisted(request.group_id, request.platform_type):
-            not_allowed_resp = f"This chat with ID: {request.group_id}, is not whitelisted, please ask Naseer to whitelist it"
-            logger.warning(f"Group {request.group_id} on platform {request.platform_type} is not whitelisted")
-            return ProcessMessageResponse(
-                response=not_allowed_resp,
-                error=None
-            )
-        
         # Convert Pydantic model to SplitBotRequest
         split_bot_request = SplitBotRequest(
             message=request.message,
-            group_id=request.group_id,
+            group_id=group_id,
             sender=request.sender,
-            image_url=request.image_url
+            platform_type=platform_type,
+            image_url=request.image_url,
+            image_base64=request.image_base64,
+            bot_name=request.bot_name or "me"
         )
         
-        # Process the message
+        # Process the message (None => stay silent, e.g. non-bill image)
         ai_response = await process_message(split_bot_request)
-        
+
+        # Track successful message processing (including intentional silence)
+        messages_processed_total.labels(
+            platform_type=platform_type,
+            group_id=group_id
+        ).inc()
+
         return ProcessMessageResponse(
             response=ai_response,
             error=None
@@ -157,6 +159,11 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
     except ValueError as e:
         # Handle validation errors (e.g., OCR failures)
         logger.error(f"ValueError in process_message: {str(e)}")
+        # Track failed message processing
+        messages_processed_total.labels(
+            platform_type=platform_type,
+            group_id=group_id
+        ).inc()
         return ProcessMessageResponse(
             response=None,
             error=str(e)
@@ -165,6 +172,11 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
     except Exception as e:
         # Handle any other unexpected errors
         logger.error(f"Unexpected error in process_message: {str(e)}", exc_info=True)
+        # Track failed message processing
+        messages_processed_total.labels(
+            platform_type=platform_type,
+            group_id=group_id
+        ).inc()
         return ProcessMessageResponse(
             response=None,
             error=f"Internal server error: {str(e)}"
@@ -172,7 +184,7 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
 
 
 @app.get("/users", response_model=List[UserResponse])
-async def get_users(
+def get_users(
     limit: Optional[int] = Query(None, ge=1, description="Maximum number of users to return"),
     offset: int = Query(0, ge=0, description="Number of users to skip")
 ) -> List[UserResponse]:
@@ -182,8 +194,11 @@ async def get_users(
     Supports pagination via limit and offset query parameters.
     Returns a list of all users if no limit is specified.
     """
+    start_time = time.time()
     try:
         users = get_all_users(limit=limit, offset=offset)
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="get_users").observe(duration)
         return [UserResponse(
             id=user.id,
             name=user.name,
@@ -195,18 +210,22 @@ async def get_users(
             updated_at=user.updated_at
         ) for user in users]
     except Exception as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="get_users").observe(duration)
+        db_errors_total.labels(operation="get_users", error_type=type(e).__name__).inc()
         logger.error(f"Error getting users: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.post("/users", response_model=UserResponse, status_code=201)
-async def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
+def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
     """
     Create a new user in the splitwise database.
     
     Requires name and email. Telegram username and WhatsApp number are optional.
     Returns the created user object.
     """
+    start_time = time.time()
     try:
         user = create_user(
             name=request.name,
@@ -215,6 +234,9 @@ async def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
             whatsapp_number=request.whatsapp_number,
             whatsapp_lid=request.whatsapp_lid
         )
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="create_user").observe(duration)
+        users_created_total.inc()
         return UserResponse(
             id=user.id,
             name=user.name,
@@ -226,13 +248,81 @@ async def create_user_endpoint(request: CreateUserRequest) -> UserResponse:
             updated_at=user.updated_at
         )
     except UniqueViolation as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="create_user").observe(duration)
+        db_errors_total.labels(operation="create_user", error_type="UniqueViolation").inc()
         logger.error(f"User with email {request.email} already exists: {str(e)}")
         raise HTTPException(status_code=409, detail=f"User with email {request.email} already exists")
     except ValueError as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="create_user").observe(duration)
+        db_errors_total.labels(operation="create_user", error_type="ValueError").inc()
         logger.error(f"Validation error creating user: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="create_user").observe(duration)
+        db_errors_total.labels(operation="create_user", error_type=type(e).__name__).inc()
         logger.error(f"Unexpected error creating user: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.put("/users/{user_id}", response_model=UserResponse)
+def update_user_endpoint(user_id: int, request: UpdateUserRequest) -> UserResponse:
+    """
+    Update an existing user in the splitwise database.
+    
+    All fields are optional. Only provided fields will be updated.
+    Returns the updated user object.
+    """
+    start_time = time.time()
+    try:
+        # Check if user exists
+        existing_user = get_user_by_id(user_id)
+        if not existing_user:
+            raise HTTPException(status_code=404, detail=f"User with id {user_id} not found")
+        
+        # Update the user
+        updated_user = update_user(
+            user_id=user_id,
+            name=request.name,
+            email=request.email,
+            telegram_username=request.telegram_username,
+            whatsapp_number=request.whatsapp_number,
+            whatsapp_lid=request.whatsapp_lid
+        )
+        
+        if not updated_user:
+            raise HTTPException(status_code=404, detail=f"User with id {user_id} not found")
+        
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="update_user").observe(duration)
+        
+        return UserResponse(
+            id=updated_user.id,
+            name=updated_user.name,
+            email=updated_user.email,
+            telegram_username=updated_user.telegram_username,
+            whatsapp_number=updated_user.whatsapp_number,
+            whatsapp_lid=updated_user.whatsapp_lid,
+            created_at=updated_user.created_at,
+            updated_at=updated_user.updated_at
+        )
+    except HTTPException:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="update_user").observe(duration)
+        raise
+    except UniqueViolation as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="update_user").observe(duration)
+        db_errors_total.labels(operation="update_user", error_type="UniqueViolation").inc()
+        logger.error(f"User with email {request.email} already exists: {str(e)}")
+        raise HTTPException(status_code=409, detail=f"User with email {request.email} already exists")
+    except Exception as e:
+        duration = time.time() - start_time
+        db_query_duration_seconds.labels(operation="update_user").observe(duration)
+        db_errors_total.labels(operation="update_user", error_type=type(e).__name__).inc()
+        logger.error(f"Unexpected error updating user: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 

@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import httpx
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -18,7 +19,7 @@ if not SPLITWISE_TOKEN:
 @dataclass
 class ExpenseUser:
     """Represents a user in an expense."""
-    sender_id: str  # Can be telegram_username or whatsapp_number
+    username: str  # Can be telegram_username or whatsapp_number
     owed_share: float
     paid_share: float
 
@@ -36,6 +37,42 @@ class AddExpenseRequest:
     def __post_init__(self):
         if self.users is None:
             self.users = []
+
+
+def replace_usernames_with_names(details: str, username_to_name: dict) -> str:
+    """
+    Replace usernames in the details string with their corresponding names.
+    Handles usernames with or without @ symbol prefix.
+    
+    Args:
+        details: The details string that may contain usernames
+        username_to_name: Dictionary mapping username -> name
+    
+    Returns:
+        str: The details string with usernames replaced by names
+    """
+    if not details or not username_to_name:
+        return details
+    
+    result = details
+    # Sort by length (longest first) to avoid partial replacements
+    # e.g., if we have "john_doe" and "john", we want to replace "john_doe" first
+    sorted_usernames = sorted(username_to_name.keys(), key=len, reverse=True)
+    
+    for username in sorted_usernames:
+        name = username_to_name[username]
+        # Escape special regex characters in username
+        escaped_username = re.escape(username)
+        
+        # Replace @username with name (handle @ prefix first)
+        pattern_with_at = r'@' + escaped_username + r'\b'
+        result = re.sub(pattern_with_at, name, result)
+        
+        # Replace plain username with name (word boundary to avoid partial matches)
+        pattern_plain = r'\b' + escaped_username + r'\b'
+        result = re.sub(pattern_plain, name, result)
+    
+    return result
 
 
 def validate_and_parse_expense_request(request_json: str) -> Tuple[Optional[AddExpenseRequest], Optional[str]]:
@@ -84,8 +121,8 @@ def validate_and_parse_expense_request(request_json: str) -> Tuple[Optional[AddE
             continue
         
         user_missing_fields = []
-        if "sender_id" not in user:
-            user_missing_fields.append("sender_id")
+        if "username" not in user:
+            user_missing_fields.append("username")
         if "owed_share" not in user:
             user_missing_fields.append("owed_share")
         if "paid_share" not in user:
@@ -101,7 +138,7 @@ def validate_and_parse_expense_request(request_json: str) -> Tuple[Optional[AddE
     try:
         users = [
             ExpenseUser(
-                sender_id=str(user["sender_id"]),
+                username=str(user["username"]),
                 owed_share=float(user["owed_share"]),
                 paid_share=float(user["paid_share"])
             )
@@ -141,7 +178,7 @@ def add_expense(request_json: str) -> str:
             "category_id": 25 (optional, default: 25),
             "users": [
                 {
-                    "sender_id": "sender id is the username part of the @username of the user. Make sure you don't pass the @ symbol in the sender_id",
+                    "username": "username is the username part of the @username of the user. Make sure you don't pass the @ symbol in the username",
                     "owed_share": 10.0,
                     "paid_share": 25.0
                 },
@@ -158,27 +195,29 @@ def add_expense(request_json: str) -> str:
         if error:
             return error
         
-        # Validate that all sender_ids exist in the database
-        # sender_id could be either telegram_username or whatsapp_number
+        # Validate that all usernames exist in the database
+        # username could be either telegram_username or whatsapp_number
         # Pass the same value to both parameters - search_users uses OR logic
-        missing_sender_ids = []
+        missing_usernames = []
         user_emails = {}
+        username_to_name = {}
         
         for user in expense_request.users:
-            sender_id = str(user.sender_id)
+            username = str(user.username)
             
             # Search for user by telegram_username OR whatsapp_number
             # search_users uses OR logic, so passing the same value to both will match either field
-            found_users = search_users(telegram_username=sender_id, whatsapp_number=sender_id)
+            found_users = search_users(telegram_username=username, whatsapp_lid=username)
             
             if found_users:
                 db_user = found_users[0]
-                user_emails[user.sender_id] = db_user.email
+                user_emails[user.username] = db_user.email
+                username_to_name[user.username] = db_user.name
             else:
-                missing_sender_ids.append(sender_id)
+                missing_usernames.append(username)
         
-        if missing_sender_ids:
-            return f"These users dont exist in the db ({','.join(missing_sender_ids)})"
+        if missing_usernames:
+            return f"These users dont exist in the db ({','.join(missing_usernames)})"
         
         # Build the request payload
         # Splitwise requires the authenticated user (splitbot) to be involved in the expense.
@@ -195,11 +234,12 @@ def add_expense(request_json: str) -> str:
         }
         
         if expense_request.details:
-            payload["details"] = expense_request.details
+            # Replace usernames with names in the details field
+            payload["details"] = replace_usernames_with_names(expense_request.details, username_to_name)
         
         # Add users to payload
         for idx, user in enumerate(expense_request.users):
-            email = user_emails[user.sender_id]
+            email = user_emails[user.username]
             payload[f"users__{idx}__email"] = email
             payload[f"users__{idx}__paid_share"] = str(user.paid_share)
             payload[f"users__{idx}__owed_share"] = str(user.owed_share)
@@ -265,7 +305,7 @@ def update_expense(expense_id: str, request_json: str) -> str:
             "category_id": 25 (optional, default: 25),
             "users": [
                 {
-                    "sender_id": "sender_id",
+                    "username": "username is the username part of the @username of the user. Make sure you don't pass the @ symbol in the username",
                     "owed_share": 10.0,
                     "paid_share": 25.0
                 },
@@ -282,27 +322,29 @@ def update_expense(expense_id: str, request_json: str) -> str:
         if error:
             return error
         
-        # Validate that all sender_ids exist in the database
-        # sender_id could be either telegram_username or whatsapp_number
+        # Validate that all usernames exist in the database
+        # username could be either telegram_username or whatsapp_number
         # Pass the same value to both parameters - search_users uses OR logic
-        missing_sender_ids = []
+        missing_usernames = []
         user_emails = {}
+        username_to_name = {}
         
         for user in expense_request.users:
-            sender_id = str(user.sender_id)
+            username = str(user.username)
             
             # Search for user by telegram_username OR whatsapp_number
             # search_users uses OR logic, so passing the same value to both will match either field
-            found_users = search_users(telegram_username=sender_id, whatsapp_number=sender_id)
+            found_users = search_users(telegram_username=username, whatsapp_lid=username)
             
             if found_users:
                 db_user = found_users[0]
-                user_emails[user.sender_id] = db_user.email
+                user_emails[user.username] = db_user.email
+                username_to_name[user.username] = db_user.name
             else:
-                missing_sender_ids.append(sender_id)
+                missing_usernames.append(username)
         
-        if missing_sender_ids:
-            return f"These users dont exist in the db ({','.join(missing_sender_ids)})"
+        if missing_usernames:
+            return f"These users dont exist in the db ({','.join(missing_usernames)})"
         
         # Build the request payload
         # Splitwise requires the authenticated user (splitbot) to be involved in the expense.
@@ -319,11 +361,12 @@ def update_expense(expense_id: str, request_json: str) -> str:
         }
         
         if expense_request.details:
-            payload["details"] = expense_request.details
+            # Replace usernames with names in the details field
+            payload["details"] = replace_usernames_with_names(expense_request.details, username_to_name)
         
         # Add users to payload
         for idx, user in enumerate(expense_request.users):
-            email = user_emails[user.sender_id]
+            email = user_emails[user.username]
             payload[f"users__{idx}__email"] = email
             payload[f"users__{idx}__paid_share"] = str(user.paid_share)
             payload[f"users__{idx}__owed_share"] = str(user.owed_share)

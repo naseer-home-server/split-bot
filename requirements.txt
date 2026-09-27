@@ -11,4 +11,6 @@ psycopg[binary,pool]
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
+prometheus-fastapi-instrumentator>=7.0.0
+prometheus-client>=0.20.0
 
