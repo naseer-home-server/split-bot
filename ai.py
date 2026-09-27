@@ -18,6 +18,7 @@ from whatsapp_totals.tools import (
     export_bill_to_google_sheet,
 )
 from ocr import ocr_image_url, ocr_image_base64, set_logger
+from bill_classifier import classify_ocr_as_bill
 from metrics import (
     ai_processing_duration_seconds,
     ai_processing_total,
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 
 # Set logger for OCR module
 set_logger(logger)
+
+
+class SilentSkip(Exception):
+    """Signal that the bot must send no response (e.g. non-bill image)."""
+
+    pass
 
 # System prompt for the AI
 SYSTEM_PROMPT = """You are Split. You help users split dinner bills in a group chat. The WhatsApp group_id for this chat is <GROUP_ID> (pass this exact value as group_id to create_bill_totals). Follow the workflow below.
@@ -99,39 +106,38 @@ class SplitBotRequest:
 
         # Process OCR if image_base64 is provided (priority over image_url)
         if self.image_base64:
-            logger.info(f"Processing OCR for base64 image")
+            logger.info("Processing OCR for base64 image")
             ocr_text = await ocr_image_base64(
                 self.image_base64.data, self.image_base64.mtype
             )
-            if not ocr_text or ocr_text.startswith("Error:"):
-                # Raise exception if OCR failed - will be caught in process_message
-                raise ValueError(
-                    ocr_text
-                    if ocr_text
-                    else "Sorry, I couldn't extract any text from the image."
-                )
+            await self._require_bill_ocr(ocr_text)
             message += f"\n\nOCR Image Text: {ocr_text}"
         # Process OCR if image_url is provided
         elif self.image_url:
-            logger.info(f"Processing OCR for image URL: {self.image_url}")
+            logger.info("Processing OCR for image URL: %s", self.image_url)
             ocr_text = await ocr_image_url(self.image_url)
-            if not ocr_text or ocr_text.startswith("Error:"):
-                # Raise exception if OCR failed - will be caught in process_message
-                raise ValueError(
-                    ocr_text
-                    if ocr_text
-                    else "Sorry, I couldn't extract any text from the image."
-                )
+            await self._require_bill_ocr(ocr_text)
             message += f"\n\nOCR Image Text: {ocr_text}"
 
         return message
+
+    async def _require_bill_ocr(self, ocr_text: Optional[str]) -> None:
+        """
+        After OCR, gate image handling through Jev. Non-bills and OCR failures
+        raise SilentSkip so ingress stays completely silent.
+        """
+        if not ocr_text or ocr_text.startswith("Error:"):
+            # Fail closed: empty/garbled OCR is not a bill — stay silent.
+            raise SilentSkip()
+        if not await classify_ocr_as_bill(ocr_text):
+            raise SilentSkip()
 
 
 def get_system_prompt(bot_name: str, group_id: str) -> str:
     return SYSTEM_PROMPT.replace("<BOT_NAME>", bot_name).replace("<GROUP_ID>", group_id)
 
 
-async def process_message(request: SplitBotRequest) -> str:
+async def process_message(request: SplitBotRequest) -> Optional[str]:
     """
     Process a message using Grok 4 Fast via OpenRouter with conversation memory stored in PostgreSQL.
     Uses LangChain agents with checkpoint-based memory.
@@ -140,16 +146,30 @@ async def process_message(request: SplitBotRequest) -> str:
         request: SplitBotRequest object containing message, group_id, sender, platform_type, and optionally image_url
 
     Returns:
-        The AI's response as a string
+        The AI's response as a string, or None when the bot must stay silent
+        (non-bill / empty OCR after image classification).
     """
     platform_type = request.platform_type.strip().upper()
     start_time = time.time()
 
-    # Get user message (OCR processing happens inside to_user_message)
+    # Get user message (OCR + bill classification happen inside to_user_message)
     try:
         user_message = await request.to_user_message()
+    except SilentSkip:
+        duration = time.time() - start_time
+        ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
+            duration
+        )
+        ai_processing_total.labels(
+            platform_type=platform_type, status="skipped_non_bill"
+        ).inc()
+        logger.info(
+            "Skipping response for group=%s (non-bill or unusable OCR)",
+            request.group_id,
+        )
+        return None
     except ValueError as e:
-        # Return error message if OCR failed
+        # Return error message if OCR failed in an unexpected way
         duration = time.time() - start_time
         ai_processing_duration_seconds.labels(platform_type=platform_type).observe(
             duration

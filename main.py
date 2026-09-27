@@ -142,15 +142,15 @@ async def process_message_endpoint(request: ProcessMessageRequest) -> ProcessMes
             bot_name=request.bot_name or "me"
         )
         
-        # Process the message
+        # Process the message (None => stay silent, e.g. non-bill image)
         ai_response = await process_message(split_bot_request)
-        
-        # Track successful message processing
+
+        # Track successful message processing (including intentional silence)
         messages_processed_total.labels(
             platform_type=platform_type,
             group_id=group_id
         ).inc()
-        
+
         return ProcessMessageResponse(
             response=ai_response,
             error=None
